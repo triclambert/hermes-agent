@@ -114,8 +114,10 @@ class TestBuildWebUISkipsWhenFresh:
 
         mock_cp = __import__("subprocess").CompletedProcess([], 0, stdout=b"", stderr=b"")
         with patch("hermes_cli.main.shutil.which", return_value="/usr/bin/npm"), \
+             patch("hermes_cli.main._ensure_tui_node") as mock_ensure_node, \
              patch("hermes_cli.main.subprocess.run", return_value=mock_cp) as mock_run:
             result = _build_web_ui(web_dir)
 
         assert result is True
+        mock_ensure_node.assert_called_once_with(min_version=(20, 19, 0))
         assert mock_run.call_count == 2  # npm install + npm run build

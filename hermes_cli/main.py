@@ -957,7 +957,75 @@ def _hermes_ink_bundle_stale(tui_dir: Path) -> bool:
     return False
 
 
-def _ensure_tui_node() -> None:
+def _node_version_on_path() -> tuple[int, int, int]:
+    return _node_version_from_executable("node")
+
+
+def _node_version_from_executable(node: str) -> tuple[int, int, int]:
+    try:
+        result = subprocess.run(
+            [node, "--version"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return (0, 0, 0)
+
+    raw_version = result.stdout or result.stderr or ""
+    if isinstance(raw_version, bytes):
+        raw_version = raw_version.decode(errors="ignore")
+    version = raw_version.strip().lstrip("v")
+    parts = version.split(".")
+    parsed: list[int] = []
+    for part in parts[:3]:
+        parsed.append(int(part) if part.isdigit() else 0)
+    while len(parsed) < 3:
+        parsed.append(0)
+    return (parsed[0], parsed[1], parsed[2])
+
+
+def _node_on_path_at_least(min_version: tuple[int, int, int]) -> bool:
+    return _node_version_on_path() >= min_version
+
+
+def _activate_local_node_if_modern(min_version: tuple[int, int, int]) -> bool:
+    """Prepend an already-installed modern Node to PATH when one is discoverable."""
+    hermes_home = Path(os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes"))
+    candidates: list[Path] = []
+
+    env_node = os.environ.get("HERMES_NODE")
+    if env_node:
+        candidates.append(Path(env_node))
+
+    candidates.append(hermes_home / "node" / "bin" / "node")
+    candidates.extend(Path.home().glob(".nvm/versions/node/v*/bin/node"))
+    candidates.extend(Path.home().glob("Library/Application Support/fnm/node-versions/v*/installation/bin/node"))
+    candidates.extend(Path.home().glob(".local/share/fnm/node-versions/v*/installation/bin/node"))
+
+    seen: set[Path] = set()
+    for node in candidates:
+        try:
+            node = node.expanduser().resolve()
+        except OSError:
+            continue
+        if node in seen or not node.is_file() or not os.access(node, os.X_OK):
+            continue
+        seen.add(node)
+        npm = node.parent / "npm"
+        if not npm.is_file() or not os.access(npm, os.X_OK):
+            continue
+        if _node_version_from_executable(str(node)) < min_version:
+            continue
+        parts = os.environ.get("PATH", "").split(os.pathsep)
+        node_dir = str(node.parent)
+        if node_dir not in parts:
+            os.environ["PATH"] = os.pathsep.join([node_dir, *parts])
+        return True
+    return False
+
+
+def _ensure_tui_node(min_version: tuple[int, int, int] = (20, 0, 0)) -> None:
     """Make sure `node` + `npm` are on PATH for the TUI.
 
     If either is missing and scripts/lib/node-bootstrap.sh is available, source
@@ -967,10 +1035,12 @@ def _ensure_tui_node() -> None:
     new binaries in this Python process — regardless of which version manager
     was used (nvm, fnm, proto, brew, or the bundled fallback).
 
-    Idempotent no-op when node+npm are already discoverable. Set
+    Idempotent no-op when node+npm are already discoverable and modern enough. Set
     ``HERMES_SKIP_NODE_BOOTSTRAP=1`` to disable auto-install.
     """
-    if shutil.which("node") and shutil.which("npm"):
+    if shutil.which("node") and shutil.which("npm") and _node_on_path_at_least(min_version):
+        return
+    if _activate_local_node_if_modern(min_version):
         return
     if os.environ.get("HERMES_SKIP_NODE_BOOTSTRAP"):
         return
@@ -990,7 +1060,13 @@ def _ensure_tui_node() -> None:
                 "-c",
                 f'source "{helper}" >&2 && ensure_node >&2 && command -v node',
             ],
-            env={**os.environ, "HERMES_HOME": hermes_home},
+            env={
+                **os.environ,
+                "HERMES_HOME": hermes_home,
+                # The shell helper only supports integer major-version checks.
+                # Use Node 22 when a stricter minor release is required.
+                "HERMES_NODE_MIN_VERSION": str(min_version[0] if min_version[1:] == (0, 0) else 22),
+            },
             capture_output=True,
             text=True,
             check=False,
@@ -5315,6 +5391,11 @@ def _build_web_ui(web_dir: Path, *, fatal: bool = False) -> bool:
 
     if not _web_ui_build_needed(web_dir):
         return True
+
+    # Vite 7 requires Node >=20.19.0 (or >=22.12.0). The regular TUI path
+    # already bootstraps Node; the dashboard build needs the same guard before
+    # resolving npm, otherwise an old shell Node can make the frontend fail.
+    _ensure_tui_node(min_version=(20, 19, 0))
 
     npm = shutil.which("npm")
     if not npm:
