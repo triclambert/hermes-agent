@@ -1,0 +1,54 @@
+name: Sync fork from upstream
+
+on:
+  schedule:
+    - cron: "17 9 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-fork-main
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    if: github.repository == 'triclambert/hermes-agent'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Sync main
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          workflow=".github/workflows/sync-fork.yml"
+          tmp_workflow="$(mktemp)"
+          cp "$workflow" "$tmp_workflow"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/NousResearch/hermes-agent.git
+          git fetch upstream main
+          git reset --hard upstream/main
+
+          mkdir -p "$(dirname "$workflow")"
+          cp "$tmp_workflow" "$workflow"
+          rm -f "$tmp_workflow"
+
+          git add "$workflow"
+          if git diff --cached --quiet && git diff --quiet HEAD; then
+            echo "Fork is already up to date."
+            exit 0
+          fi
+
+          git commit -m "chore: sync fork from upstream"
+          git push origin HEAD:main
